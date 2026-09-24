@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>FlyWire‑Powered Flappy Bird</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:sans-serif;background:#111;color:#eee;display:flex;height:100vh;overflow:hidden}
+  #ui{flex:0 0 300px;background:#1a1a2e;padding:12px;display:flex;flex-direction:column;gap:8px;border-right:1px solid #333}
+  #ui h2{font-size:14px;color:#8cf;letter-spacing:.05em}
+  #ui p{font-size:11px;color:#aaa;line-height:1.5}
+  #status{font-size:11px;color:#ff0;word-break:break-all}
+  #neuro-stats{font-size:11px;color:#8cf;white-space:pre;font-family:monospace}
+  #graph{width:276px;height:340px;display:block;border:1px solid #333;border-radius:4px;background:#0a0a18}
+  canvas#canvas{flex:1;display:block;background:#000}
+  #legend{font-size:10px;color:#888;display:flex;gap:8px;flex-wrap:wrap}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px}
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <h2>🧠 FlyWire Neural Brain</h2>
+  <p>Real <em>Drosophila</em> connectome controls the bird.<br>You are the spectator.</p>
+  <p id="status">Loading circuit…</p>
+  <p id="neuro-stats"> </p>
+  <div id="legend">
+    <span><span class="dot" style="background:#3af"></span>Input</span>
+    <span><span class="dot" style="background:#fa0"></span>Motor</span>
+    <span><span class="dot" style="background:#888"></span>Inter</span>
+    <button id="viewBtn" onclick="toggleView()" style="margin-left:auto;background:#2a2a4a;color:#8cf;border:1px solid #446;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:10px">View: 3D Brain</button>
+  </div>
+  <canvas id="graph" width="276" height="340"></canvas>
+  <div id="bio-panel" style="font-size:10px;color:#aaa;background:#0d0d1e;padding:8px;border-radius:4px;border:1px solid #224;max-height:110px;overflow-y:auto;line-height:1.4">
+    <div style="color:#8cf;font-weight:bold;margin-bottom:4px">🔬 Active Drosophila Cell Types:</div>
+    <div id="bio-types">Loading cell classifications…</div>
+  </div>
+</div>
+<canvas id="canvas"></canvas>
+
+<script>
+/* ── canvas setup ─────────────────────────────── */
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d');
+const graphCanvas = document.getElementById('graph');
+const gctx        = graphCanvas.getContext('2d');
+const statusEl    = document.getElementById('status');
+const neuroStats  = document.getElementById('neuro-stats');
+const viewBtn     = document.getElementById('viewBtn');
+
+let is3D = true;
+let rotY = 0.4;
+let rotX = 0.25;
+
+function toggleView(){
+  is3D = !is3D;
+  viewBtn.textContent = `View: ${is3D ? '3D Brain' : '2D Map'}`;
+}
+
+// 3D perspective projection onto 2D canvas
+function project3D(p3d){
+  if(!p3d) return { x: 138, y: 170, z: 0, scale: 1 };
+  const cosY = Math.cos(rotY), sinY = Math.sin(rotY);
+  const x1 = p3d.x * cosY + p3d.z * sinY;
+  const z1 = -p3d.x * sinY + p3d.z * cosY;
+
+  const cosX = Math.cos(rotX), sinX = Math.sin(rotX);
+  const y2 = p3d.y * cosX - z1 * sinX;
+  const z2 = p3d.y * sinX + z1 * cosX;
+
+  const fov   = 240;
+  const dist  = 260;
+  const scale = fov / (dist + z2);
+  const cx    = graphCanvas.width / 2;
+  const cy    = graphCanvas.height / 2;
+
+  return {
+    x: cx + x1 * scale,
+    y: cy + y2 * scale,
+    z: z2,
+    scale
+  };
+}
+
+let W, H;
+function resize(){
+  W = canvas.width  = window.innerWidth - 300;
+  H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ── game constants ───────────────────────────── */
+const GRAVITY      = 0.38;   // Smooth gravity
+const FLAP         = -5.8;   // Gentle precise micro-flap (44px jump height)
+const PIPE_SPEED   = 2;
+const PIPE_GAP     = 150;   // 150px gap for clean clearance
+const PIPE_SPACING = 250;
+
+// Neural timing
+const dt  = 0.016;   // ~60 fps frame step
+const TAU = 0.05;    // membrane time constant
+
+// Flap threshold & Input gain — calibrated for responsive neural network
+const MOTOR_THRESH = 0.04;
+const INPUT_GAIN   = 1.0;
+
+let pipes = [], frame = 0, score = 0;
+let bird  = {x:80, y:0, vy:0};
+let flapCooldown = 0;
+
+/* ── neural state ─────────────────────────────── */
+let neurons = {}, edges = [], inputIds = [], motorIds = [];
+let inEdges = {};   // per-neuron incoming edge cache
+let brainMesh = []; // 3D brain shell mesh vertices
+
+function rebuildIndex(){
+  inEdges = {};
+  for(const e of edges){
+    if(!inEdges[e.dst]) inEdges[e.dst] = [];
+    inEdges[e.dst].push(e);
+  }
+}
+
+/* fallback circuit — tiny hand-crafted 4-neuron net */
+function buildFallback(){
+  neurons = {
+    1:{type:'input', a:0, pos:{x:40, y:100}},
+    2:{type:'input', a:0, pos:{x:40, y:240}},
+    3:{type:'inter', a:0, pos:{x:138,y:170}},
+    4:{type:'motor', a:0, pos:{x:236,y:170}}
+  };
+  edges = [
+    {src:1,dst:3,w:1,  sign:1},
+    {src:2,dst:3,w:0.8,sign:1},
+    {src:3,dst:4,w:1,  sign:1}
+  ];
+  inputIds = ['1','2'];
+  motorIds = ['4'];
+  rebuildIndex();
+}
+buildFallback();
+
+/* ── load brain_mesh.json (from .obj) ────────── */
+fetch('brain_mesh.json')
+  .then(r => r.json())
+  .then(data => {
+    brainMesh = data.vertices || [];
+    console.log(`Loaded 3D brain shell mesh: ${brainMesh.length} vertices`);
+  })
+  .catch(err => console.warn('brain_mesh.json not loaded:', err));
+
+/* ── load circuit.json ────────────────────────── */
+fetch('circuit.json')
+  .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+  .then(data => {
+    neurons  = data.neurons;
+    edges    = data.edges;
+    inputIds = data.inputIds;
+    rebuildIndex();
+
+    // Only keep motors that actually have ≥1 incoming edge (connected)
+    motorIds = data.motorIds.filter(id => inEdges[id] && inEdges[id].length > 0);
+
+    const nCount = Object.keys(neurons).length;
+    statusEl.textContent =
+      `✅ ${nCount} neurons · ${edges.length} edges · ${motorIds.length} motors`;
+
+    // Populate cell type breakdown panel
+    const typesMap = {};
+    for(const nid in neurons){
+      const ct = neurons[nid].ctype || neurons[nid].scls || 'Interneuron';
+      if(ct && ct !== 'Unknown') typesMap[ct] = (typesMap[ct] || 0) + 1;
+    }
+    const topTypes = Object.entries(typesMap)
+      .sort((a,b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([k,v]) => `<span style="display:inline-block;margin-right:6px"><b style="color:#8cf">${k}</b><span style="color:#668">(${v})</span></span>`)
+      .join(' ');
+    document.getElementById('bio-types').innerHTML = topTypes || 'Optic & Descending Motor Neurons';
+  })
+  .catch(err => {
+    statusEl.textContent = '⚠ circuit.json not found — fallback active';
+    console.warn(err);
+  });
+
+
+
+/* ── neural update ────────────────────────────── */
+function updateNeurons(sensory){
+  const { distNorm, diffY, vy } = sensory;
+
+  // Height error in pixels: positive when bird is BELOW gap center
+  // Combine with downward velocity (vy > 0 means falling)
+  const errPixels  = diffY + vy * 6;
+  const climbDrive = Math.max(0, Math.min(1.0, errPixels / 60.0));
+
+  // Danger signal = 0 when bird is in/above gap, ramps to 1.0 when below gap
+  const danger = Math.max(0, Math.min(1.0, climbDrive * INPUT_GAIN));
+
+  // Drive input neurons retinotopically (spatially by pos.y)
+  for(const id of inputIds){
+    const n = neurons[id];
+    if(!n) continue;
+    const yNorm = (n.pos.y - 20) / 320; // [0, 1]
+    const spatialWeight = 0.7 + 0.6 * (1 - yNorm); // upper inputs get up to 1.3x gain
+    n.a = Math.max(0, Math.min(1.0, danger * spatialWeight));
+  }
+
+  // Run 3 neural sub-steps per frame to propagate signals through multi-hop interneurons
+  const subSteps  = 3;
+  const subDt     = dt / subSteps;
+  const stdFactor = 1 - subDt / TAU;
+  const decayFactor = danger > 0 ? stdFactor : 0.35; // Gated decay clears pipeline when safe
+  const drive     = subDt / TAU;
+
+  for(let step = 0; step < subSteps; step++){
+    const newA = {};
+    for(const id in neurons){
+      if(neurons[id].type === 'input') continue;
+
+      let sum = 0;
+      const inc = inEdges[id];
+      if(inc && inc.length > 0){
+        for(const e of inc){
+          const pre = neurons[e.src];
+          if(pre) sum += e.sign * e.w * pre.a;
+        }
+      }
+      newA[id] = Math.max(0, Math.min(1.0, decayFactor * neurons[id].a + drive * sum));
+    }
+    for(const id in newA){
+      if(neurons[id].type !== 'input') neurons[id].a = newA[id];
+    }
+  }
+}
+
+
+
+
+
+
+
+/* ── game logic ───────────────────────────────── */
+function addPipe(){
+  const gapY = Math.random() * (H - PIPE_GAP - 100) + 50;
+  pipes.push({x: W, gapY, scored: false});
+}
+
+function resetGame(){
+  bird = {x:80, y:H/2, vy:0};
+  pipes = [];
+  score = 0;
+  flapCooldown = 0;
+  for(const id in neurons) neurons[id].a = 0;
+}
+
+function stepGame(){
+  // advance pipes
+  for(const p of pipes){
+    p.x -= PIPE_SPEED;
+    if(!p.scored && p.x + 30 < bird.x){ p.scored = true; score++; }
+  }
+  if(!pipes.length || pipes[pipes.length-1].x < W - PIPE_SPACING) addPipe();
+  while(pipes.length && pipes[0].x < -60) pipes.shift();
+
+  // find next pipe
+  const next = pipes.find(p => p.x + 30 > bird.x - 10) || pipes[0];
+  if(!next) return;
+
+  // sensory signals: lookahead horizon of 350px
+  const distPx     = next.x - bird.x;
+  const LOOKAHEAD  = 350;
+  const distNorm   = Math.max(0, Math.min(1.0, distPx / LOOKAHEAD));
+  const gapCentreY = next.gapY + PIPE_GAP / 2;
+  const diffY      = bird.y - gapCentreY;
+
+  updateNeurons({ distNorm, diffY, vy: bird.vy });
+
+  if(flapCooldown > 0) flapCooldown--;
+
+  // motor decision
+  const acts = motorIds.map(id => neurons[id]?.a ?? 0);
+  const maxM = acts.length ? Math.max(...acts) : 0;
+  const shouldFlap = maxM > MOTOR_THRESH && flapCooldown === 0;
+
+  // debug snapshot
+  const errPixels = diffY + bird.vy * 6;
+  const danger = Math.max(0, Math.min(1.0, Math.max(0, errPixels / 60.0) * INPUT_GAIN));
+  window._dbg = { danger, dist: distNorm, diffY, maxM, flap: shouldFlap };
+
+  if(shouldFlap) {
+    bird.vy = FLAP;
+    flapCooldown = 10; // 10 frames (~0.16s) impulse cooldown
+  }
+
+  // physics
+  bird.vy += GRAVITY;
+  bird.y  += bird.vy;
+  if(bird.y > H - 12){ bird.y = H - 12; bird.vy = 0; }
+  if(bird.y < 12)    { bird.y = 12;     bird.vy = 0; }
+
+  // collision
+  const hit = pipes.some(p => {
+    if(bird.x + 10 > p.x && bird.x - 10 < p.x + 30)
+      return bird.y - 10 < p.gapY || bird.y + 10 > p.gapY + PIPE_GAP;
+  });
+  if(hit) resetGame();
+}
+
+
+/* ── rendering ────────────────────────────────── */
+function drawGame(){
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0,0,W,H);
+
+  // pipes
+  for(const p of pipes){
+    ctx.fillStyle   = '#2d6a2d';
+    ctx.fillRect(p.x, 0, 30, p.gapY);
+    ctx.strokeStyle = '#4a9a4a'; ctx.lineWidth = 2;
+    ctx.strokeRect(p.x, 0, 30, p.gapY);
+
+    ctx.fillStyle = '#2d6a2d';
+    ctx.fillRect(p.x, p.gapY + PIPE_GAP, 30, H - p.gapY - PIPE_GAP);
+    ctx.strokeRect(p.x, p.gapY + PIPE_GAP, 30, H - p.gapY - PIPE_GAP);
+  }
+
+  // aim line to gap centre
+  const next = pipes.find(p => p.x + 30 > bird.x) || pipes[0];
+  if(next){
+    ctx.strokeStyle = 'rgba(140,200,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(bird.x, bird.y);
+    ctx.lineTo(next.x + 15, next.gapY + PIPE_GAP / 2);
+    ctx.stroke();
+  }
+
+  /* ── Fruit Fly (Drosophila melanogaster) rendering ── */
+  ctx.save();
+  ctx.translate(bird.x, bird.y);
+
+  // Pitch rotation based on velocity (-30deg to +30deg)
+  const pitch = Math.max(-0.6, Math.min(0.6, bird.vy * 0.07));
+  ctx.rotate(pitch);
+
+  // Wing flapping animation
+  const wingAngle = (flapCooldown > 0 || bird.vy < 0)
+    ? Math.sin(frame * 0.8) * 0.6
+    : Math.sin(frame * 0.2) * 0.15;
+
+  // Back Wing
+  ctx.save();
+  ctx.translate(-2, -4);
+  ctx.rotate(-0.4 + wingAngle);
+  ctx.fillStyle = 'rgba(210, 240, 255, 0.65)';
+  ctx.strokeStyle = 'rgba(120, 180, 220, 0.6)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.ellipse(-4, -10, 6, 15, -0.2, 0, Math.PI * 2);
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
+
+  // Legs
+  ctx.strokeStyle = '#4e342e';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(-4, 4); ctx.lineTo(-7, 10);
+  ctx.moveTo(0, 4);  ctx.lineTo(-1, 11);
+  ctx.moveTo(4, 4);  ctx.lineTo(5, 10);
+  ctx.stroke();
+
+  // Abdomen (striped)
+  ctx.fillStyle = '#8d6e63';
+  ctx.beginPath();
+  ctx.ellipse(-6, 1, 10, 6, -0.1, 0, Math.PI * 2);
+  ctx.fill();
+  // Abdominal stripes
+  ctx.fillStyle = '#3e2723';
+  ctx.fillRect(-12, -4, 2, 8);
+  ctx.fillRect(-8,  -5, 2, 10);
+  ctx.fillRect(-4,  -5, 2, 10);
+
+  // Thorax
+  ctx.fillStyle = '#6d4c41';
+  ctx.beginPath();
+  ctx.arc(2, 0, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Head
+  ctx.fillStyle = '#4e342e';
+  ctx.beginPath();
+  ctx.arc(8, -1, 4.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Red Compound Eye
+  ctx.fillStyle = '#ff1744';
+  ctx.beginPath();
+  ctx.arc(9, -2.5, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(10.2, -3.5, 1, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Front Wing
+  ctx.save();
+  ctx.translate(1, -4);
+  ctx.rotate(-0.6 - wingAngle);
+  ctx.fillStyle = 'rgba(230, 248, 255, 0.75)';
+  ctx.strokeStyle = 'rgba(80, 160, 210, 0.8)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.ellipse(-2, -11, 6.5, 16, -0.1, 0, Math.PI * 2);
+  ctx.fill(); ctx.stroke();
+
+  // Wing veins
+  ctx.beginPath();
+  ctx.moveTo(-2, -3); ctx.lineTo(-3, -22);
+  ctx.moveTo(-2, -10); ctx.lineTo(1, -20);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.restore();
+
+  // score
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 20px sans-serif';
+  ctx.fillText('Score: ' + score, 20, 30);
+
+  // debug overlay
+  if(window._dbg){
+    ctx.font = '12px monospace'; ctx.fillStyle = 'rgba(255,255,180,0.9)';
+    ctx.fillText(`danger  : ${window._dbg.danger.toFixed(3)}`, 20, 55);
+    ctx.fillText(`dist    : ${window._dbg.dist.toFixed(3)}`, 20, 70);
+    const sign = window._dbg.diffY > 0 ? '+' : '';
+    ctx.fillText(`offset  : ${sign}${window._dbg.diffY.toFixed(0)}px`, 20, 85);
+    ctx.fillText(`maxMotor: ${window._dbg.maxM.toFixed(3)} / ${MOTOR_THRESH}`, 20, 100);
+    ctx.fillStyle = window._dbg.flap ? '#ff0' : '#888';
+    ctx.fillText(window._dbg.flap ? '⚡ FLAP' : '· hold', 20, 115);
+  }
+}
+
+/* ── neural graph (2D / 3D) ─────────────────────── */
+function drawGraph(){
+  const gW = graphCanvas.width, gH = graphCanvas.height;
+  gctx.clearRect(0,0,gW,gH);
+  gctx.fillStyle = '#0a0a18'; gctx.fillRect(0,0,gW,gH);
+
+  if(is3D){
+    rotY += 0.006; // smooth 3D brain auto-rotation
+  }
+
+  // Render 3D brain surface mesh shell (from VFB_00101567 .obj)
+  if(is3D && brainMesh.length > 0){
+    gctx.fillStyle = 'rgba(40,140,220,0.18)';
+    for(let i = 0; i < brainMesh.length; i += 2){
+      const v = brainMesh[i];
+      const p = project3D({ x: v[0], y: v[1], z: v[2] });
+      const r = Math.max(0.8, 1.2 * p.scale);
+      gctx.beginPath();
+      gctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      gctx.fill();
+    }
+  }
+
+  // Pre-calculate positions for all neurons
+  const projected = {};
+  for(const [id, n] of Object.entries(neurons)){
+    projected[id] = is3D ? project3D(n.pos3d) : { x: n.pos.x, y: n.pos.y, z: 0, scale: 1 };
+  }
+
+  // Draw 3D/2D edges
+  for(const e of edges){
+    const s = projected[e.src];
+    const d = projected[e.dst];
+    if(!s || !d) continue;
+    const act = neurons[e.src]?.a || 0;
+    if(act < 0.005) continue;
+    const alpha = Math.min(0.9, 0.08 + act * 3);
+    gctx.strokeStyle = e.sign > 0
+      ? `rgba(0,220,120,${alpha})`
+      : `rgba(255,60,60,${alpha})`;
+    gctx.lineWidth = Math.max(0.8, 1.2 * (s.scale || 1));
+    gctx.beginPath(); gctx.moveTo(s.x, s.y); gctx.lineTo(d.x, d.y); gctx.stroke();
+  }
+
+  // Draw nodes (depth-sorted back-to-front in 3D mode)
+  const sortedNodes = Object.entries(neurons).map(([id, n]) => ({
+    id, n, proj: projected[id]
+  }));
+  if(is3D){
+    sortedNodes.sort((a, b) => b.proj.z - a.proj.z);
+  }
+
+  for(const { id, n, proj } of sortedNodes){
+    const { x, y, scale } = proj;
+    const a = n.a || 0;
+    const baseR = n.type === 'motor' ? 7 : n.type === 'input' ? 5 : 3;
+    const r = Math.max(1.5, baseR * (is3D ? scale : 1));
+
+    let colour;
+    if(a > MOTOR_THRESH && n.type === 'motor'){
+      colour = '#ffff44';
+    } else if(n.type === 'motor'){
+      colour = `rgba(255,${100+Math.floor(a*155)},0,0.9)`;
+    } else if(n.type === 'input'){
+      colour = `rgba(${40+Math.floor(a*60)},${160+Math.floor(a*95)},255,0.85)`;
+    } else {
+      const v = 60 + Math.floor(a * 195);
+      colour = `rgba(${v},${v},${v},0.7)`;
+    }
+
+    gctx.fillStyle = colour;
+    gctx.beginPath(); gctx.arc(x, y, r, 0, Math.PI*2); gctx.fill();
+  }
+}
+
+/* ── main loop ────────────────────────────────── */
+function loop(){
+  frame++;
+  stepGame();
+  drawGame();
+  drawGraph();
+
+  if(frame % 20 === 0){
+    const acts  = motorIds.map(id => neurons[id]?.a ?? 0);
+    const maxM  = acts.length ? Math.max(...acts).toFixed(3) : '—';
+    const flap  = acts.some(a => a > MOTOR_THRESH) ? '🟡 FLAP' : '⚫ hold';
+    const avgIn = inputIds.length
+      ? (inputIds.reduce((s,id) => s+(neurons[id]?.a||0), 0) / inputIds.length).toFixed(3)
+      : '—';
+    neuroStats.textContent =
+      `Inputs: ${inputIds.length}   Motors: ${motorIds.length}\n` +
+      `Avg input act : ${avgIn}\n` +
+      `Max motor act : ${maxM}  ${flap}\n` +
+      `Threshold     : ${MOTOR_THRESH}`;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+bird.y = H / 2;
+addPipe();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
