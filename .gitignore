@@ -1,3 +1,6 @@
 # Windows download metadata
 *:Zone.Identifier
 *Zone.Identifier
+
+# Large source tables (keep local, do not publish)
+*.csv.gz
